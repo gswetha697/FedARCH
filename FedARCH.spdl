@@ -1,0 +1,31 @@
+protocol FedARCH(Client, Server) 
+{
+    role Client 
+    {
+        fresh ModelC: Nonce;         // Local model update
+        fresh HEkey: Nonce;          // CKKS encryption key
+        fresh Timestamp: Nonce;      // Synchronization nonce
+        fresh EncryptedModelC: Data; // Encrypted model weight
+        fresh EncryptedAggModel: Data; // Secure aggregated model from server
+
+        send_1(Client, Server, EncryptedModelC, Timestamp); // Send encrypted model weights with timestamp
+        recv_2(Server, Client, EncryptedAggModel); // Receive encrypted aggregated model
+
+        claim(Client, Secret, ModelC);  // Ensure local model secrecy
+        claim(Client, Nisynch);         // Ensure synchronization in FL
+    }
+
+    role Server 
+    {
+        var EncryptedModelC: Data;      // Placeholder for received encrypted model
+        fresh AggregatedModel: Data;    // Aggregated model (before encryption)
+        fresh EncryptedAggModel: Data;  // Aggregated model (encrypted)
+        fresh Timestamp: Nonce;         // Synchronization timestamp
+
+        recv_1(Client, Server, EncryptedModelC, Timestamp); // Receive encrypted model from client
+        send_2(Server, Client, EncryptedAggModel); // Send encrypted aggregated model
+
+        claim(Server, Secret, AggregatedModel); // Server ensures secrecy of aggregation
+        claim(Server, Nisynch);                 // Ensure synchronicity in FL
+    }
+}
