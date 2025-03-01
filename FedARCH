@@ -1,9 +1,4 @@
-#FL with FedARCH and CKKS (FedARCH) 20 rounds and 10 clients 99% accuracy
-import tenseal as ts
-from datetime import datetime 
-import random
-from sklearn.metrics import confusion_matrix, classification_report
-import matplotlib.pyplot as plt
+#noise level 1 and s=0.1 d=0.1 notify
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,40 +8,43 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import numpy as np
 from torch.utils.data import random_split, DataLoader
+import tenseal as ts
+import warnings
+from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+from datetime import datetime 
 
 
-def plot_metrics(train_losses_all, train_accuracies_all, num_rounds):
-    # Flatten the nested lists
-    train_losses_all_flat = [np.mean(client_losses, axis=0) for client_losses in train_losses_all]
-    train_accuracies_all_flat = [np.mean(client_accuracies, axis=0) for client_accuracies in train_accuracies_all]
+# Calculate confusion matrix and classification report
+def calculate_metrics(all_preds, all_labels):
+    cm = confusion_matrix(all_labels, all_preds)
+    cr = classification_report(all_labels, all_preds, target_names=['Meningioma', 'Glioma', 'Pituitary', 'NoTumor'])
+    return cm, cr
 
-    rounds = list(range(1, num_rounds + 1))
-    
+# Plot training accuracy and loss
+def plot_metrics(train_losses, train_accuracies, rounds):
     plt.figure(figsize=(12, 5))
 
-    # Plot training accuracies
+    # Plot loss
     plt.subplot(1, 2, 1)
-    for client_idx, client_accuracies in enumerate(train_accuracies_all_flat):
-        plt.plot(rounds, client_accuracies, label=f'Client {client_idx + 1}')
-    plt.xlabel('Rounds')
-    plt.ylabel('Accuracy')
-    plt.title('Training Accuracies')
-    plt.legend()
-
-    # Plot training losses
-    plt.subplot(1, 2, 2)
-    for client_idx, client_losses in enumerate(train_losses_all_flat):
-        plt.plot(rounds, client_losses, label=f'Client {client_idx + 1}')
+    for client_idx in range(len(train_losses)):
+        plt.plot(range(1, rounds + 1), train_losses[client_idx], label=f'Client {client_idx + 1}')
+    plt.title('Training Loss')
     plt.xlabel('Rounds')
     plt.ylabel('Loss')
-    plt.title('Training Losses')
+    plt.legend()
+
+    # Plot accuracy
+    plt.subplot(1, 2, 2)
+    for client_idx in range(len(train_accuracies)):
+        plt.plot(range(1, rounds + 1), train_accuracies[client_idx], label=f'Client {client_idx + 1}')
+    plt.title('Training Accuracy')
+    plt.xlabel('Rounds')
+    plt.ylabel('Accuracy')
     plt.legend()
 
     plt.tight_layout()
     plt.show()
-
-now = datetime.now()
-start_time = now.strftime("%H:%M:%S")
 
 # Define BrainTumorResNet model
 class BrainTumorResNet(nn.Module):
@@ -58,6 +56,79 @@ class BrainTumorResNet(nn.Module):
     def forward(self, x):
         x = self.base_model(x)
         return x  # Output raw logits (we'll apply softmax in the loss function)
+
+# Setup CKKS context
+def setup_ckks_context():
+    poly_modulus_degree = 8192
+    coeff_mod_bit_sizes = [60, 40, 40, 60]
+    context = ts.context(
+        ts.SCHEME_TYPE.CKKS, poly_modulus_degree, -1, coeff_mod_bit_sizes
+    )
+    context.generate_galois_keys()
+    context.global_scale = 2**40
+    return context
+
+import tenseal as ts
+
+# Encrypt weights
+def encrypt_weights(weights, context):
+    encrypted_weights = {}
+    for k, v in weights.items():
+        vector = ts.ckks_vector(context, v.numpy().flatten().tolist())
+        encrypted_weights[k] = vector
+    return encrypted_weights
+
+# Decrypt weights
+def decrypt_weights(encrypted_weights, context, weight_shapes):
+    decrypted_weights = {}
+    for k, v in encrypted_weights.items():
+        decrypted_vector = v.decrypt()
+        decrypted_weights[k] = torch.tensor(decrypted_vector).view(weight_shapes[k])
+    return decrypted_weights
+
+# Initialize reputations
+def initialize_reputations(num_clients):
+    return np.ones(num_clients)
+
+# Update reputations
+def update_reputations(reputations, performances, smoothing_factor=0.1, decay_factor=0.1):
+    new_reputations = (smoothing_factor * reputations + (1 - smoothing_factor) * performances) * decay_factor
+    return new_reputations / new_reputations.sum()
+
+# Aggregate encrypted weights with reputations
+def aggregate_encrypted_weights(encrypted_weights_list, client_weights):
+    aggregated_encrypted_weights = {}
+    for k in encrypted_weights_list[0].keys():
+        aggregated_vector = sum(
+            w * encrypted_weights_list[i][k] for i, w in enumerate(client_weights)
+        )
+        aggregated_encrypted_weights[k] = aggregated_vector
+    return aggregated_encrypted_weights
+
+# Train local model
+def train_local_model(model, dataloader, epochs):
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    model.train()
+    train_losses = []
+    train_accuracies = []
+    for epoch in range(epochs):
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        for inputs, labels in dataloader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+        train_losses.append(running_loss / len(dataloader))
+        train_accuracies.append(correct / total)
+    return model.state_dict(), train_losses, train_accuracies
 
 # Evaluate model
 def evaluate_model(model, dataloader):
@@ -77,38 +148,30 @@ def evaluate_model(model, dataloader):
     accuracy = correct / total
     return accuracy, all_preds, all_labels
 
-# Calculate confusion matrix and classification report
-def calculate_metrics(all_preds, all_labels):
-    cm = confusion_matrix(all_labels, all_preds)
-    cr = classification_report(all_labels, all_preds, target_names=['Meningioma', 'Glioma', 'Pituitary', 'NoTumor'])
-    return cm, cr
+def update_noisy_clients(client_loaders, client_datasets, round_num, noise_level, old_noisy_client_idx=None, new_noisy_client_idx=None):
+    """
+    Update noisy clients by removing noise from the old noisy client and adding noise to a new client.
+    """
+    # Remove noise from the old noisy client after the specified number of rounds
+    if old_noisy_client_idx is not None:
+        clean_data = [(data, label) for data, label in client_datasets[old_noisy_client_idx]]
+        client_loaders[old_noisy_client_idx] = DataLoader(clean_data, batch_size=32, shuffle=True)
+    
+    # Add noise to the new noisy client
+    if new_noisy_client_idx is not None:
+        noisy_data = [(add_noise_to_data(data, noise_level), label) for data, label in client_datasets[new_noisy_client_idx]]
+        client_loaders[new_noisy_client_idx] = DataLoader(noisy_data, batch_size=32, shuffle=True)
+    
+    return client_loaders
 
-# Encrypt weights
-def encrypt_weights(weights, context):
-    encrypted_weights = {}
-    for k, v in weights.items():
-        vector = ts.ckks_vector(context, v.numpy().flatten().tolist())
-        encrypted_weights[k] = vector
-    return encrypted_weights
+def add_noise_to_data(data, noise_level=1):
+    """
+    Adds noise to the data to simulate an underperforming client.
+    """
+    noisy_data = data + noise_level * torch.randn_like(data)
+    return torch.clamp(noisy_data, 0, 1)
 
-# Decrypt weights
-def decrypt_weights(encrypted_weights, context, weight_shapes):
-    decrypted_weights = {}
-    for k, v in encrypted_weights.items():
-        decrypted_vector = v.decrypt()
-        decrypted_weights[k] = torch.tensor(decrypted_vector).view(weight_shapes[k])
-    return decrypted_weights
-def aggregate_weights_simple(weights_list):
-    temp = 1/len(weights_list)
-    avg_weights = {}
-    for k in weights_list[0].keys():
-        avg_weights[k] = sum([weights[k] for weights in weights_list]) * temp
-    return avg_weights
-
-def federated_learning_with_reputation(num_clients=10, num_rounds=20, epochs_per_round=1):
-    # Setup CKKS context
-    context = setup_ckks_context()
-
+def create_data_loaders(train_path, test_path, num_clients, underperforming_client_idx=None, noise_level=1):
     # Data augmentation and preprocessing
     data_transforms = transforms.Compose([
         transforms.Resize((256, 256)),
@@ -118,11 +181,16 @@ def federated_learning_with_reputation(num_clients=10, num_rounds=20, epochs_per
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
-    train_path = "kaggle/Training"
-    test_path = "kaggle/Testing"
-
     train_set = datasets.ImageFolder(root=train_path, transform=data_transforms)
-    test_set = datasets.ImageFolder(root=test_path, transform=data_transforms)
+    complete_test_set = datasets.ImageFolder(root=test_path, transform=data_transforms)
+
+    # Split test set into validation and test sets
+    validation_ratio = 0.5  # Adjust this ratio as needed
+    num_test_samples = len(complete_test_set)
+    num_val_samples = int(validation_ratio * num_test_samples)
+    num_test_samples = num_test_samples - num_val_samples
+
+    val_set, test_set = random_split(complete_test_set, [num_val_samples, num_test_samples])
 
     # Split data among clients
     client_data_sizes = [len(train_set) // num_clients for _ in range(num_clients)]
@@ -130,9 +198,48 @@ def federated_learning_with_reputation(num_clients=10, num_rounds=20, epochs_per
         client_data_sizes[i] += 1
 
     client_datasets = random_split(train_set, client_data_sizes)
-    client_loaders = [DataLoader(client_data, batch_size=32, shuffle=True) for client_data in client_datasets]
+
+    client_loaders = []
+    for idx, client_data in enumerate(client_datasets):
+        if idx == 1 or idx == 2 or idx == 3 or idx==5:
+            noisy_data = [(add_noise_to_data(data), label) for data, label in client_data]
+            client_loaders.append(DataLoader(noisy_data, batch_size=32, shuffle=True))
+        else:
+            client_loaders.append(DataLoader(client_data, batch_size=32, shuffle=True))
+
+    val_loader = DataLoader(val_set, batch_size=32, shuffle=False)
     test_loader = DataLoader(test_set, batch_size=32, shuffle=False)
-    local_weights_all = []
+
+    return client_loaders, client_datasets, val_loader, test_loader
+
+# Example usage:
+train_path = "kaggle/Training"
+test_path = "kaggle/Testing"
+num_clients = 10
+underperforming_client_idx = 2  # Simulate client 3 as underperforming
+noise_level = 1  # Noise level for the underperforming client
+
+
+# Update reputations
+def update_reputations(reputations, performances, smoothing_factor=0.1, decay_factor=0.1):
+    smoothing_factor=0.9
+    decay_factor=0.9
+    new_reputations = (smoothing_factor * reputations + (1 - smoothing_factor) * performances) * decay_factor
+    return new_reputations / new_reputations.sum()
+
+now = datetime.now()
+start_time = now.strftime("%H:%M:%S")
+
+def federated_learning_with_underperforming_client(num_clients=10, num_rounds=20, epochs_per_round=1, underperforming_client_idx=2, noise_level=1):
+    # Setup CKKS context
+    context = setup_ckks_context()
+
+    # Create DataLoaders
+    train_path = "kaggle/Training"
+    test_path = "kaggle/Testing"
+    client_loaders, client_datasets, val_loader, test_loader = create_data_loaders(train_path, test_path, num_clients, underperforming_client_idx, noise_level)
+
+    # The rest of the federated learning function
     train_losses_all = [[] for _ in range(num_clients)]
     train_accuracies_all = [[] for _ in range(num_clients)]
 
@@ -140,14 +247,24 @@ def federated_learning_with_reputation(num_clients=10, num_rounds=20, epochs_per
     global_model = BrainTumorResNet()
     global_weights = global_model.state_dict()
 
+    weight_shapes = {k: v.shape for k, v in global_weights.items()}
+
     # Initialize reputations
-    client_reputations = np.ones(num_clients)
+    client_reputations = initialize_reputations(num_clients)
 
     for round_num in range(num_rounds):
+        with open('FL_WorkFlow_notify.txt', 'a') as file:
+            file.write(f'Round {round_num + 1}/{num_rounds}\n')
         print(f'Round {round_num + 1}/{num_rounds}')
+
+        # Update noisy clients
+        if round_num == 7:
+            client_loaders = update_noisy_clients(client_loaders, client_datasets, round_num, noise_level, old_noisy_client_idx=underperforming_client_idx, new_noisy_client_idx=4)
 
         # Train each client model and collect local weights
         client_performances = []
+        local_weights_all = []
+        val_accuracies_all = []
 
         for client_idx in range(num_clients):
             local_model = BrainTumorResNet()
@@ -156,39 +273,53 @@ def federated_learning_with_reputation(num_clients=10, num_rounds=20, epochs_per
             train_losses_all[client_idx].append(train_losses[-1])
             train_accuracies_all[client_idx].append(train_accuracies[-1])
             local_weights_all.append(local_weights)
-            #accuracy, _, _ = evaluate_model(local_model, test_loader)
-            #client_performances.append(accuracy)
-            #print(f"Client {client_idx + 1}: Training Accuracy = {accuracy:.2f}")
-            client_performances.append(train_accuracies[-1])  # Use training accuracy for performance
-            print(f"Client {client_idx + 1}: Training Accuracy = {train_accuracies[-1]:.2f}")
-
-        # Update weights using client performances and reputations
-        client_weights = np.array(client_performances) * client_reputations
-        client_weights /= client_weights.sum()
+            accuracy, _, _ = evaluate_model(local_model, val_loader)
+            client_performances.append(accuracy)
+            with open('FL_WorkFlow_notify.txt', 'a') as file:
+                file.write(f"Client {client_idx + 1}: Validation Accuracy = {accuracy:.2f}\n")
+            print(f"Client {client_idx + 1}: Validation Accuracy = {accuracy:.2f}")
+            val_accuracies_all.append(accuracy)
 
         # Encrypt client weights
         encrypted_weights_list = [encrypt_weights(weights, context) for weights in local_weights_all]
 
-        # Aggregate weights
-        aggregated_encrypted_weights = aggregate_encrypted_weights(encrypted_weights_list, client_weights)
-        decrypted_aggregated_weights = decrypt_weights(aggregated_encrypted_weights, context)
+        # Update reputations
+        client_reputations = update_reputations(client_reputations, np.array(client_performances))
+        with open('FL_WorkFlow_notify.txt', 'a') as file:
+            file.write(f'Client_reputations after round {round_num + 1}: {client_reputations}\n')
+
+        # Aggregate encrypted weights using weighted average
+        aggregated_encrypted_weights = aggregate_encrypted_weights(encrypted_weights_list, client_reputations)
+
+        # Decrypt aggregated weights
+        decrypted_aggregated_weights = decrypt_weights(aggregated_encrypted_weights, context, weight_shapes)
 
         # Convert decrypted weights back to torch tensors and update global weights
         global_weights = {k: torch.tensor(v, dtype=torch.float32).view_as(global_weights[k]) for k, v in decrypted_aggregated_weights.items()}
         global_model.load_state_dict(global_weights)
+        sum=0
+        k=0
+        for i in val_accuracies_all:
+            sum+=i
+        avg=sum/len(val_accuracies_all)
+        for i in val_accuracies_all:
+            k+=1
+            if i<avg:
+                with open('FL_WorkFlow_notify.txt', 'a') as file:
+                    file.write(f'Client {k} is underperforming\n')
+                print(f'Client {k} is underperforming')
 
         # Evaluate global model
         global_accuracy, all_preds, all_labels = evaluate_model(global_model, test_loader)
+        with open('FL_WorkFlow_notify.txt', 'a') as file:
+            file.write(f'Round {round_num + 1}: Global Model Accuracy = {global_accuracy:.2f}\n')
         print(f'Round {round_num + 1}: Global Model Accuracy = {global_accuracy:.2f}')
-
-        # Update reputations
-        client_reputations *= client_weights
 
     # Final evaluation
     global_accuracy, all_preds, all_labels = evaluate_model(global_model, test_loader)
+    with open('FL_WorkFlow_notify.txt', 'a') as file:
+        file.write(f'Final Global Model Accuracy = {global_accuracy:.2f}\n')
     print(f'Final Global Model Accuracy = {global_accuracy:.2f}')
-    
-    #print(train_accuracies_all)
     
     # Plot training metrics
     plot_metrics(train_losses_all, train_accuracies_all, num_rounds)
@@ -197,11 +328,9 @@ def federated_learning_with_reputation(num_clients=10, num_rounds=20, epochs_per
     cm, cr = calculate_metrics(all_preds, all_labels)
     print("Confusion Matrix:\n", cm)
     print("Classification Report:\n", cr)
-    
-    #return train_losses_all, train_accuracies_all
 
-# Run the FedARCH workflow
-federated_learning_with_reputation(num_clients=10, num_rounds=20, epochs_per_round=1)
+# Example usage:
+federated_learning_with_underperforming_client(num_clients=10, num_rounds=20, epochs_per_round=1, underperforming_client_idx=2, noise_level=1)
 
 
 now = datetime.now()
