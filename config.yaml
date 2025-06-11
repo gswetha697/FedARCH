@@ -1,0 +1,9 @@
+# config.yaml
+training:
+  epochs: 1
+  batch_size: 32
+  loss_function: cross_entropy
+  optimizer:
+    type: SGD
+    learning_rate: 0.01
+    momentum: 0.9
